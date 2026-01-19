@@ -19,8 +19,8 @@ public class RollGuassianPathState : MonoBehaviour
     [SerializeField] private float sigmaStepsMain = 0.9f;
     [SerializeField] private float sigmaStepsSub = 0.75f;
 
-    [SerializeField] private int neighborCountMain = 2; // ±2 => 5 motors
-    [SerializeField] private int neighborCountSub = 1;  // ±1 => 3 motors
+    [SerializeField] private int neighborCountMain = 2;
+    [SerializeField] private int neighborCountSub = 1;
     [SerializeField] private float cutoff01 = 0.02f;
 
     [Header("Weights per group")]
@@ -34,22 +34,18 @@ public class RollGuassianPathState : MonoBehaviour
     [Header("bHaptics Call")]
     [SerializeField] private int durationMillis = 50;
 
-    private const int VestMotorCount = 32; // ✅ 32로 통일(vest)
+    private const int VestMotorCount = 32;
 
-    [Header("Roll Paths (Front/Back run together)")]
+    [Header("Roll Paths (FRONT ONLY)")]
     [SerializeField] private int[] mainFront = { 12, 13, 14, 15, 11, 7, 3, 2, 1, 0, 4, 8 };
-    [SerializeField] private int[] mainBack  = { 28, 29, 30, 31, 27, 23, 19, 18, 17, 16, 20, 24 };
-
     [SerializeField] private int[] subFront  = { 9, 10, 6, 5 };
-    [SerializeField] private int[] subBack   = { 25, 26, 22, 21 };
 
     private float[] _raw01 = new float[VestMotorCount];
     private float[] _smoothed01 = new float[VestMotorCount];
 
     private bool _running;
-
     private int _step;        // 0..11
-    private float _phase;     // 0..1 within current step
+    private float _phase;     // 0..1
     private int MainSteps => mainFront.Length; // 12
     private int SubSteps  => subFront.Length;  // 4
 
@@ -76,11 +72,9 @@ public class RollGuassianPathState : MonoBehaviour
 
         float centerMain = _step + _phase;
         ApplyGaussianOnPath(mainFront, centerMain, sigmaStepsMain, neighborCountMain, mainScale);
-        ApplyGaussianOnPath(mainBack,  centerMain, sigmaStepsMain, neighborCountMain, mainScale);
 
         float centerSub = GetSubCenterFromMain(_step, _phase);
         ApplyGaussianOnPath(subFront, centerSub, sigmaStepsSub, neighborCountSub, subScale);
-        ApplyGaussianOnPath(subBack,  centerSub, sigmaStepsSub, neighborCountSub, subScale);
 
         float a = 1f - Mathf.Exp(-dt / Mathf.Max(0.0001f, smoothingTau));
         for (int i = 0; i < VestMotorCount; i++)
@@ -93,7 +87,7 @@ public class RollGuassianPathState : MonoBehaviour
         BhapticsLibrary.PlayMotors((int)PositionType.Vest, motorValues, durationMillis);
     }
 
-    // ===== ✅ Manager hooks =====
+    // ===== Manager hooks =====
     public void StartStage(float speedDegPerSec)
     {
         SetSpeedDegPerSec(speedDegPerSec);
@@ -191,4 +185,7 @@ public class RollGuassianPathState : MonoBehaviour
         d -= len * 0.5f;
         return d;
     }
+
+    public void SetMaxIntensity01(float v) => maxIntensity01 = Mathf.Clamp01(v);
+    public float GetMaxIntensity01() => maxIntensity01;
 }
