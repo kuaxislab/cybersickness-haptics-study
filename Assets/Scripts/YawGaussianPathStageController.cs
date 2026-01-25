@@ -4,10 +4,18 @@ using Bhaptics.SDK2;
 
 public class YawGaussianPathStageController : MonoBehaviour
 {
+    public enum NormalizationMode { None, Peak, Energy }
+
     // =========================
     // Manager compatibility API
     // =========================
     public enum YawStage { Front, Side }
+
+    public void SetNormalizationMode(NormalizationMode mode, float energyTargetMotors = 2.5f)
+    {
+        normalizationMode = mode;
+        energyTarget = Mathf.Max(0.01f, energyTargetMotors);
+    }
 
     public void StartStage(YawStage st, float speedDegPerSec)
     {
@@ -21,25 +29,20 @@ public class YawGaussianPathStageController : MonoBehaviour
         _running = false;
         Array.Clear(_raw01, 0, _raw01.Length);
         Array.Clear(_smoothed01, 0, _smoothed01.Length);
-        Array.Clear(_motorValues, 0, _motorValues.Length);
-        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValues, 80);
+        Array.Clear(_motorValues01, 0, _motorValues01.Length);
+        Array.Clear(_motorValuesInt, 0, _motorValuesInt.Length);
+
+        // ✅ SDK는 int[]를 원함
+        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValuesInt, 80);
     }
 
-    // Stage 1-1: Front/Back 공통(기본 붓) 조정
-    // Stage 1-2: Seam(겨드랑이)만 조정
     public float GetSigmaForStage(YawStage st) => (st == YawStage.Front) ? sigmaFrontBack : sigmaSeam;
 
     public void SetSigmaForStage(YawStage st, float sigma)
     {
         sigma = Mathf.Max(1e-4f, sigma);
-        if (st == YawStage.Front)
-        {
-            sigmaFrontBack = sigma; // front+back
-        }
-        else
-        {
-            sigmaSeam = sigma;      // seam only
-        }
+        if (st == YawStage.Front) sigmaFrontBack = sigma;
+        else sigmaSeam = sigma;
     }
 
     public void SetMaxIntensity01(float v) => maxIntensity01 = Mathf.Clamp01(v);
@@ -57,20 +60,26 @@ public class YawGaussianPathStageController : MonoBehaviour
     [Range(0f, 1f)]
     [SerializeField] private float maxIntensity01 = 0.30f;
 
+    [Header("Perceived Intensity Lock (optional)")]
+    [SerializeField] private NormalizationMode normalizationMode = NormalizationMode.None;
+
+    [Tooltip("Energy mode target: interpreted as sum(v/peak), i.e., 'number of motors at peak'.")]
+    [SerializeField] private float energyTarget = 2.5f;
+
+    [Header("Normalization Smoothing")]
+    [SerializeField] private float normalizationTau = 0.12f; // 0.08~0.20 recommended
+    private float _normScaleSmoothed = 1f;
+
     [Header("Yaw Full Loop Path")]
     [SerializeField] private int[] loopPath = { 4, 5, 6, 7, 23, 22, 21, 20 };
 
     [Header("Sigma (Front+Back vs Seam)")]
-    [Tooltip("Front(4-5-6-7) and Back(23-22-21-20) share this sigma.")]
     [SerializeField] private float sigmaFrontBack = 0.70f;
-
-    [Tooltip("Only applied near seams: (7<->23) and (20<->4). Usually larger.")]
     [SerializeField] private float sigmaSeam = 0.90f;
 
-    [Tooltip("How wide the seam region is (in index units). 0.7~1.3 recommended.")]
     [SerializeField] private float seamWidthIdx = 1.0f;
 
-    [Header("Neighborhood (IMPORTANT)")]
+    [Header("Neighborhood")]
     [SerializeField] private int neighborCount = 2;
 
     [Header("Threshold & Cutoff")]
@@ -84,49 +93,49 @@ public class YawGaussianPathStageController : MonoBehaviour
     [Range(0f, 0.2f)]
     [SerializeField] private float minOn01 = 0.00f;
 
-    [SerializeField] private float outputGamma = 1.20f;
-
-    [Header("Time Smoothing")]
+    [Header("Smoothing")]
     [SerializeField] private float smoothingTau = 0.08f;
     [SerializeField] private bool useUnscaledTime = true;
 
-    [Header("bHaptics Play")]
-    [SerializeField] private int durationMillis = 30;
-
-    [Header("Optional: Segment Dwell Control (SAFE VERSION)")]
-    [SerializeField] private bool useSegmentSpeedMultiplier = false;
-    [SerializeField] private float frontSpeedMul = 1.0f;
-    [SerializeField] private float sideSpeedMul = 1.2f;
-    [SerializeField] private float speedBlendWidthIdx = 1.2f;
+    [Header("bHaptics Call")]
+    [SerializeField] private int durationMillis = 50;
 
     // =========================
-    // Runtime
+    // Runtime state
     // =========================
     private bool _running;
-    private float _s;
+    private float _pos; // continuous position along loopPath (0..N)
 
-    private readonly float[] _raw01 = new float[VestMotorCount];
-    private readonly float[] _smoothed01 = new float[VestMotorCount];
-    private readonly int[] _motorValues = new int[VestMotorCount];
+    private float[] _raw01 = new float[VestMotorCount];
+    private float[] _smoothed01 = new float[VestMotorCount];
 
-    private void Awake()
+    // 내부는 0..1 float로 유지
+    private float[] _motorValues01 = new float[VestMotorCount];
+    // ✅ SDK 전송은 0..100 int
+    private int[] _motorValuesInt = new int[VestMotorCount];
+
+    private void OnDisable() => StopAll();
+
+    private void ResetState()
     {
-        ResetState();
+        _pos = 0f;
+        Array.Clear(_raw01, 0, _raw01.Length);
+        Array.Clear(_smoothed01, 0, _smoothed01.Length);
+        Array.Clear(_motorValues01, 0, _motorValues01.Length);
+        Array.Clear(_motorValuesInt, 0, _motorValuesInt.Length);
+        _normScaleSmoothed = 1f;
     }
 
     private void OnValidate()
     {
-        neighborCount = Mathf.Max(1, neighborCount);
+        neighborCount = Mathf.Max(0, neighborCount);
         sigmaFrontBack = Mathf.Max(1e-4f, sigmaFrontBack);
         sigmaSeam = Mathf.Max(1e-4f, sigmaSeam);
-        seamWidthIdx = Mathf.Max(1e-3f, seamWidthIdx);
-
+        seamWidthIdx = Mathf.Max(1e-4f, seamWidthIdx);
         smoothingTau = Mathf.Max(1e-4f, smoothingTau);
+        normalizationTau = Mathf.Max(1e-4f, normalizationTau);
+        energyTarget = Mathf.Max(0.01f, energyTarget);
         durationMillis = Mathf.Max(10, durationMillis);
-
-        frontSpeedMul = Mathf.Max(0.01f, frontSpeedMul);
-        sideSpeedMul = Mathf.Max(0.01f, sideSpeedMul);
-        speedBlendWidthIdx = Mathf.Max(1e-3f, speedBlendWidthIdx);
     }
 
     private void Update()
@@ -136,184 +145,127 @@ public class YawGaussianPathStageController : MonoBehaviour
         float dt = useUnscaledTime ? Time.unscaledDeltaTime : Time.deltaTime;
         if (dt <= 0f) return;
 
+        int n = loopPath.Length;
+        float loopsPerSec = angularSpeedDegPerSec / 360f;
+        float stepsPerSec = loopsPerSec * n;
+
+        _pos += stepsPerSec * dt;
+        _pos %= n;
+
         Array.Clear(_raw01, 0, _raw01.Length);
 
-        if (loopPath == null || loopPath.Length == 0)
+        ApplySeamAwareGaussian(_pos);
+
+        NormalizeRawIfNeeded(dt);
+
+        float a = 1f - Mathf.Exp(-dt / Mathf.Max(1e-5f, smoothingTau));
+        for (int i = 0; i < VestMotorCount; i++)
+            _smoothed01[i] = Mathf.Lerp(_smoothed01[i], _raw01[i], a);
+
+        // output shaping (float 0..1)
+        for (int i = 0; i < VestMotorCount; i++)
         {
-            SmoothAndSend(dt);
+            float v = _smoothed01[i];
+            if (v < perceptualThreshold01) v = 0f;
+            if (v > 0f && v < minOn01) v = minOn01;
+            _motorValues01[i] = v;
+        }
+
+        // ✅ float(0..1) -> int(0..100) 변환
+        for (int i = 0; i < VestMotorCount; i++)
+        {
+            _motorValuesInt[i] = Mathf.Clamp(Mathf.RoundToInt(_motorValues01[i] * 100f), 0, 100);
+        }
+
+        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValuesInt, durationMillis);
+    }
+
+    private void NormalizeRawIfNeeded(float dt)
+    {
+        if (normalizationMode == NormalizationMode.None)
+        {
+            _normScaleSmoothed = 1f;
             return;
         }
 
-        int N = loopPath.Length;
+        float peak = Mathf.Max(1e-4f, maxIntensity01);
+        float targetScale = 1f;
 
-        // base speed in indices/sec
-        float cps = angularSpeedDegPerSec / 360f;
-        float baseSpeedIdxPerSec = cps * N;
-
-        // optional speed multiplier (blended)
-        float speedMul = 1f;
-        if (useSegmentSpeedMultiplier)
+        if (normalizationMode == NormalizationMode.Peak)
         {
-            speedMul = GetBlendedSpeedMultiplier(_s, N);
+            float maxRaw = 0f;
+            for (int i = 0; i < VestMotorCount; i++) maxRaw = Mathf.Max(maxRaw, _raw01[i]);
+            if (maxRaw > 1e-6f) targetScale = peak / maxRaw;
+        }
+        else // Energy
+        {
+            float sumNorm = 0f;
+            for (int i = 0; i < VestMotorCount; i++) sumNorm += (_raw01[i] / peak);
+            float desired = Mathf.Max(1e-3f, energyTarget);
+            if (sumNorm > 1e-6f) targetScale = desired / sumNorm;
         }
 
-        float speedIdxPerSec = baseSpeedIdxPerSec * speedMul;
+        float tau = Mathf.Max(1e-5f, normalizationTau);
+        float a = 1f - Mathf.Exp(-dt / tau);
+        _normScaleSmoothed = Mathf.Lerp(_normScaleSmoothed, targetScale, a);
 
-        // full loop update
-        _s = Wrap(_s + speedIdxPerSec * dt, N);
+        float scale = _normScaleSmoothed;
+        if (Mathf.Abs(scale - 1f) < 1e-4f) return;
 
-        // gaussian brush
-        ApplyGaussianCircular_SeamAware(loopPath, _s, maxIntensity01);
-
-        // smooth + send
-        SmoothAndSend(dt);
+        for (int i = 0; i < VestMotorCount; i++)
+            _raw01[i] = Mathf.Clamp(_raw01[i] * scale, 0f, peak);
     }
 
-    private void ResetState()
+    private void ApplySeamAwareGaussian(float centerIdx)
     {
-        _s = 0f;
-        Array.Clear(_raw01, 0, _raw01.Length);
-        Array.Clear(_smoothed01, 0, _smoothed01.Length);
-        Array.Clear(_motorValues, 0, _motorValues.Length);
-    }
+        int n = loopPath.Length;
 
-    // =========================
-    // Seam-aware Gaussian
-    // =========================
-    private void ApplyGaussianCircular_SeamAware(int[] path, float center, float peak)
-    {
-        int N = path.Length;
-        float c = Wrap(center, N);
-        int ci = Mathf.FloorToInt(c);
-
-        // seam midpoints in index space:
-        // seam A: between 3 and 4 => 3.5  (7 <-> 23)
-        // seam B: between 7 and 0 => 7.5 (20 <-> 4)  (same as -0.5)
-        const float seamA = 3.5f;
-        float seamB = (N - 0.5f); // 7.5 when N=8
-
-        // pick sigma based on how close the CENTER is to seam midpoints (circular distance)
-        float sigmaForCenter = IsNearSeam(c, seamA, seamB, N, seamWidthIdx) ? sigmaSeam : sigmaFrontBack;
-        sigmaForCenter = Mathf.Max(1e-4f, sigmaForCenter);
-        float inv2sig2 = 1f / (2f * sigmaForCenter * sigmaForCenter);
+        // seam positions: between 7<->23 (index 3<->4), and 20<->4 (index 7<->0)
+        float seamA = 3.5f;
+        float seamB = 7.5f;
 
         for (int k = -neighborCount; k <= neighborCount; k++)
         {
-            int idx = Mod(ci + k, N);
-            int motorId = path[idx];
-            if (motorId < 0 || motorId >= VestMotorCount) continue;
+            float x = centerIdx + k;
+            int idx = Mod(Mathf.RoundToInt(x), n);
 
-            float d = CircularDelta(c, idx, N);
-            float g = Mathf.Exp(-(d * d) * inv2sig2);
-            if (g < cutoff01) continue;
+            float d = WrapDist(centerIdx, idx, n);
+            float seamW = SeamWeight(centerIdx, seamA, seamB, n, seamWidthIdx);
+            float sigma = Mathf.Lerp(sigmaFrontBack, sigmaSeam, seamW);
 
-            float norm = SoftThresholdKneeImproved(g, perceptualThreshold01);
-            float outVal = norm * peak;
+            float g = Mathf.Exp(-(d * d) / (2f * sigma * sigma));
+            float v = maxIntensity01 * g;
 
-            if (outVal > _raw01[motorId]) _raw01[motorId] = outVal;
+            if (v < cutoff01) continue;
+
+            int motor = loopPath[idx];
+            _raw01[motor] = Mathf.Max(_raw01[motor], v);
         }
     }
 
-    private static bool IsNearSeam(float c, float seamA, float seamB, int N, float width)
+    private float SeamWeight(float centerIdx, float seamA, float seamB, int n, float width)
     {
-        // Use circular distance between center and seam midpoints
-        float da = CircularDelta(c, seamA, N);
-        float db = CircularDelta(c, seamB, N);
-        return (Mathf.Abs(da) <= width) || (Mathf.Abs(db) <= width);
+        float da = WrapAbs(centerIdx - seamA, n);
+        float db = WrapAbs(centerIdx - seamB, n);
+        float d = Mathf.Min(da, db);
+        return Mathf.Clamp01(1f - (d / Mathf.Max(1e-4f, width)));
     }
 
-    // overload: CircularDelta for float idx
-    private static float CircularDelta(float a, float b, int N)
+    private float WrapAbs(float x, int n)
     {
-        float d = a - b;
-        float half = N * 0.5f;
-        if (d > half) d -= N;
-        if (d < -half) d += N;
-        return d;
+        x = Mathf.Abs(x);
+        return Mathf.Min(x, n - x);
     }
 
-    private static float SoftThresholdKneeImproved(float x01, float thr01)
+    private float WrapDist(float a, float b, int n)
     {
-        if (x01 <= thr01) return 0f;
-
-        float range = 1f - thr01;
-        if (range <= 1e-6f) return x01;
-
-        float t = (x01 - thr01) / range;
-        t = Mathf.Clamp01(t);
-
-        // smoothstep
-        return t * t * (3f - 2f * t);
+        float d = Mathf.Abs(a - b);
+        return Mathf.Min(d, n - d);
     }
 
-    // =========================
-    // Output smoothing + send
-    // =========================
-    private void SmoothAndSend(float dt)
-    {
-        float alpha = 1f - Mathf.Exp(-dt / Mathf.Max(1e-5f, smoothingTau));
-        float peak = Mathf.Max(1e-4f, maxIntensity01);
-
-        for (int i = 0; i < VestMotorCount; i++)
-        {
-            _smoothed01[i] = Mathf.Lerp(_smoothed01[i], _raw01[i], alpha);
-            float v = _smoothed01[i];
-
-            if (v > 0f)
-            {
-                float norm = Mathf.Clamp01(v / peak);
-                if (minOn01 > 0f && norm > 0f && norm < minOn01) norm = minOn01;
-                norm = Mathf.Pow(norm, Mathf.Max(0.01f, outputGamma));
-                v = norm * peak;
-            }
-
-            _motorValues[i] = Mathf.RoundToInt(Mathf.Clamp01(v) * 100f);
-        }
-
-        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValues, durationMillis);
-    }
-
-    // =========================
-    // Optional speed multiplier (blended)
-    // =========================
-    private float GetBlendedSpeedMultiplier(float s, int N)
-    {
-        // boundary is between index 3 and 4 (front->back). We'll blend around 4.0.
-        float c = Wrap(s, N);
-        float b = 4f; // boundary start of back segment in this path
-
-        float dist = c - b;
-        float w = speedBlendWidthIdx;
-        float t = Mathf.Clamp01((dist + w) / (2f * w));
-        t = t * t * (3f - 2f * t);
-
-        return Mathf.Lerp(frontSpeedMul, sideSpeedMul, t);
-    }
-
-    // =========================
-    // Math helpers
-    // =========================
-    private static float Wrap(float x, int m)
-    {
-        if (m <= 0) return 0f;
-        x %= m;
-        if (x < 0f) x += m;
-        return x;
-    }
-
-    private static int Mod(int x, int m)
+    private int Mod(int x, int m)
     {
         int r = x % m;
-        if (r < 0) r += m;
-        return r;
-    }
-
-    private static float CircularDelta(float center, int idx, int N)
-    {
-        float d = center - idx;
-        float half = N * 0.5f;
-        if (d > half) d -= N;
-        if (d < -half) d += N;
-        return d;
+        return (r < 0) ? r + m : r;
     }
 }

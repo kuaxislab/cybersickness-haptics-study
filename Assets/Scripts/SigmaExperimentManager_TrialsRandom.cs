@@ -18,22 +18,18 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     public Slider sigmaSlider;
     public TMP_Text sigmaValueText;
     public Button nextButton;
+    public Button playButton;
+    public TMP_Text instructionText;
 
-    [Header("UI - Guide Images (just show on left/right)")]
-    [Tooltip("Assign Canvas BG Image if you want code to set grey.")]
+    [Header("UI - Guide Images")]
     public Image bgImage;
-
-    [Tooltip("Assign an Image UI object placed on right/left (e.g., Canvas/AxisImage)")]
     public Image axisGuideImage;
-
     public Sprite yawSprite;
     public Sprite rollSprite;
     public Sprite pitchSprite;
-
-    [Tooltip("Optional: force show/hide axis image")]
     public bool showAxisImage = true;
 
-    [Header("Canvas BG Color (optional)")]
+    [Header("Canvas BG Color")]
     public bool setBgGreyOnStart = true;
     public Color bgGrey = new Color(0.25f, 0.25f, 0.25f, 1f);
 
@@ -42,13 +38,11 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     public int sessionCount = 3;
 
     [Header("Speeds (editable in Inspector)")]
-    public float[] speedDegPerSec = new float[] { 30f, 60f, 90f };
+    public float[] yawRollSpeedsDegPerSec = new float[] { 20f, 40f, 60f };
+    public float[] pitchSpeedsDegPerSec = new float[] { 15f, 30f, 45f };
 
     [Header("Session 0 (Calibration) Settings")]
-    [Tooltip("Calibration speed (deg/sec). Session 0 uses ONLY this speed.")]
     public float calibrationSpeedDegPerSec = 60f;
-
-    [Tooltip("Default sigma used during calibration playback (Yaw/Pitch will use current controller internal defaults too).")]
     public float calibrationSigmaDefault = 0.70f;
 
     [Tooltip("Intensity slider range (Session 0 only)")]
@@ -64,9 +58,12 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     public float sigmaDefault = 0.90f;
 
     [Header("Random slider start position per stage (Session 1.. only)")]
-    [Tooltip("If true, slider starts at random position each stage. " +
-             "BUT for 2-stage directions (Yaw/Pitch) stage 2 starts from stage 1 value (natural carry).")]
+    [Tooltip("If true, slider starts at random position each stage. For Yaw/Pitch seam stage, slider starts from stage0 sigma.")]
     public bool randomizeSliderStart = true;
+
+    [Header("Flow")]
+    [Tooltip("If true, each stage waits for Play button.")]
+    public bool requirePlayButtonPerStage = true;
 
     [Header("CSV")]
     public string csvHeader =
@@ -76,89 +73,55 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     // ===== runtime state =====
     private int _sessionIdx = 0;
 
-    // Session 0: calibration steps (Yaw, Roll, Pitch fixed)
+    // Session 0: calibration steps
     private List<CalStep> _calSteps;
     private int _calStepIdx = 0;
 
-    // Session 1..: trial flow
+    // Session 1..: trials
     private List<Trial> _trials;
     private int _trialIdx = 0;
     private int _stageInTrial = 0;
 
-    // carry between stage1 -> stage2 in yaw/pitch (sigma only, session1..)
-    private float _lastYawStage1Sigma = -1f;
-    private float _lastPitchStage1Sigma = -1f;
+    // carry stage0 sigma -> stage1 slider start (Yaw/Pitch)
+    private float _lastYawStage0Sigma = -1f;
+    private float _lastPitchStage0Sigma = -1f;
 
-    // intensity calibration results
+    // calibration intensities
     private float _calYawIntensity = -1f;
     private float _calRollIntensity = -1f;
     private float _calPitchIntensity = -1f;
 
-    // ===== output paths =====
-    private string _dir;
-    private int _fileIndex;
+    // file
+    private int _fileIndex = 1;
     private string _finalCsvPath;
 
-    private System.Random _rng;
+    // play gating
+    private bool _isPlaying = false;
 
-    private void Awake()
+    private System.Random _rng = new System.Random();
+
+    private void Start()
     {
-        _rng = new System.Random(Guid.NewGuid().GetHashCode());
+        if (setBgGreyOnStart && bgImage) bgImage.color = bgGrey;
 
-        if (yawCtrl == null || rollCtrl == null || pitchCtrl == null)
-        {
-            Debug.LogError("[Experiment] Assign yawCtrl, rollCtrl, pitchCtrl in Inspector.");
-            enabled = false; return;
-        }
+        if (sigmaSlider)
+            sigmaSlider.onValueChanged.AddListener(OnSliderChanged);
 
-        if (stageLabelText == null || sigmaSlider == null || nextButton == null)
-        {
-            Debug.LogError("[Experiment] UI refs missing.");
-            enabled = false; return;
-        }
+        if (nextButton)
+            nextButton.onClick.AddListener(OnNext);
 
-        if (setBgGreyOnStart && bgImage != null)
-            bgImage.color = bgGrey;
+        if (playButton)
+            playButton.onClick.AddListener(OnPlay);
 
-        if (axisGuideImage != null)
-            axisGuideImage.enabled = showAxisImage;
-
-        sigmaSlider.onValueChanged.AddListener(OnSliderChanged);
-        nextButton.onClick.AddListener(OnNextClicked);
-
-        PrepareCsvPath_AssetsData();
-
-        // Start at Session 0 (Calibration)
-        _sessionIdx = 0;
+        PrepareCsv();
         BuildCalibrationSteps();
         EnterCalibrationStep();
     }
 
     private void OnDestroy()
     {
-        SafeStopAllControllers();
-    }
-
-    // =========================
-    // CSV: Assets/data/1.csv
-    // =========================
-    private void PrepareCsvPath_AssetsData()
-    {
-        _dir = Path.Combine(Application.dataPath, "data");
-        Directory.CreateDirectory(_dir);
-
-        int max = 0;
-        foreach (var f in Directory.GetFiles(_dir, "*.csv"))
-        {
-            var name = Path.GetFileNameWithoutExtension(f);
-            if (int.TryParse(name, out int n)) max = Mathf.Max(max, n);
-        }
-
-        _fileIndex = max + 1;
-        _finalCsvPath = Path.Combine(_dir, $"{_fileIndex}.csv");
-        File.WriteAllText(_finalCsvPath, csvHeader);
-
-        Debug.Log($"[Experiment] CSV Final: {_finalCsvPath}");
+        if (sigmaSlider)
+            sigmaSlider.onValueChanged.RemoveListener(OnSliderChanged);
     }
 
     // =========================
@@ -168,9 +131,9 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     {
         _calSteps = new List<CalStep>
         {
-            new CalStep { kind = TrialKind.Yaw },
-            new CalStep { kind = TrialKind.Roll },
-            new CalStep { kind = TrialKind.Pitch },
+            new CalStep{ kind = TrialKind.Yaw },
+            new CalStep{ kind = TrialKind.Roll },
+            new CalStep{ kind = TrialKind.Pitch },
         };
         _calStepIdx = 0;
     }
@@ -178,14 +141,10 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     private void EnterCalibrationStep()
     {
         SafeStopAllControllers();
+        _isPlaying = false;
 
-        // if finished calibration, move to session 1 trials
         if (_calStepIdx >= _calSteps.Count)
         {
-            // apply intensities to controllers (final)
-            ApplyCalibratedIntensityToAllControllers();
-
-            // next session
             _sessionIdx = 1;
             BuildTrialsForSession(_sessionIdx);
             EnterTrialStage();
@@ -193,25 +152,21 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
         }
 
         var step = _calSteps[_calStepIdx];
-
-        // UI label
-        stageLabelText.text = $"Session 0 | Calibration ({_calStepIdx + 1}/3) : {step.kind} intensity";
-
-        // image
         UpdateAxisGuideSprite(step.kind);
 
-        // slider = INTENSITY in session 0
+        if (stageLabelText) stageLabelText.text = $"Session 0 (Calibration) - {step.kind}";
+        if (instructionText) instructionText.text = "Adjust intensity, then press Next.";
+
+        float startI = GetExistingCalIntensityOrDefault(step.kind);
+
         sigmaSlider.minValue = intensityMin;
         sigmaSlider.maxValue = intensityMax;
 
-        float startI = GetExistingCalIntensityOrDefault(step.kind);
-        startI = Snap(startI, intensityMin, intensityMax, intensityStep);
+        float snapped = Snap(startI, intensityMin, intensityMax, intensityStep);
+        sigmaSlider.SetValueWithoutNotify(snapped);
+        UpdateSigmaValueText(snapped);
 
-        sigmaSlider.SetValueWithoutNotify(startI);
-        UpdateSigmaValueText(startI);
-
-        // run playback using calibration speed, and a safe sigma default
-        StartCalibrationPlayback(step.kind, calibrationSpeedDegPerSec, calibrationSigmaDefault, startI);
+        StartCalibrationPlayback(step.kind, calibrationSpeedDegPerSec, calibrationSigmaDefault, snapped);
     }
 
     private float GetExistingCalIntensityOrDefault(TrialKind kind)
@@ -227,20 +182,17 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
 
     private void StartCalibrationPlayback(TrialKind kind, float speedDegPerSec, float sigmaDefaultLocal, float intensity01)
     {
-        // intensity apply live
         ApplyIntensityForKind(kind, intensity01);
 
-        // sigma: during calibration we just run “main-ish” so user can feel strength.
-        // (You can still tweak default sigmas in each controller’s inspector if needed.)
         if (kind == TrialKind.Yaw)
         {
+            // calibration: set both to same so user feels continuity
             yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Front, sigmaDefaultLocal);
             yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Side,  sigmaDefaultLocal);
             yawCtrl.StartStage(YawGaussianPathStageController.YawStage.Front, speedDegPerSec);
         }
         else if (kind == TrialKind.Roll)
         {
-            // roll uses its own internal sigma/logic; we only control intensity here
             rollCtrl.StartStage(speedDegPerSec);
         }
         else // Pitch
@@ -285,11 +237,14 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     {
         _trials = new List<Trial>();
 
-        // Session 1..: yaw/roll/pitch randomized per speed
-        foreach (var spd in speedDegPerSec)
+        // trial-level random (Yaw, Roll at yawRoll speeds; Pitch at pitch speeds)
+        foreach (var spd in yawRollSpeedsDegPerSec)
         {
             _trials.Add(Trial.MakeYaw(spd));
             _trials.Add(Trial.MakeRoll(spd));
+        }
+        foreach (var spd in pitchSpeedsDegPerSec)
+        {
             _trials.Add(Trial.MakePitch(spd));
         }
         Shuffle(_trials);
@@ -297,10 +252,9 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
         _trialIdx = 0;
         _stageInTrial = 0;
 
-        _lastYawStage1Sigma = -1f;
-        _lastPitchStage1Sigma = -1f;
+        _lastYawStage0Sigma = -1f;
+        _lastPitchStage0Sigma = -1f;
 
-        // IMPORTANT: intensity is fixed from calibration
         ApplyCalibratedIntensityToAllControllers();
     }
 
@@ -316,116 +270,91 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     private void EnterTrialStage()
     {
         SafeStopAllControllers();
+        _isPlaying = false;
 
         // session end?
         if (_trialIdx >= _trials.Count)
         {
             _sessionIdx++;
-
-            if (_sessionIdx >= Mathf.Max(1, sessionCount))
+            if (_sessionIdx >= sessionCount)
             {
-                stageLabelText.text = "Done";
-                nextButton.interactable = false;
-                SafeStopAllControllers();
+                if (stageLabelText) stageLabelText.text = "DONE";
+                if (instructionText) instructionText.text = "";
                 return;
             }
 
             BuildTrialsForSession(_sessionIdx);
+            _trialIdx = 0;
+            _stageInTrial = 0;
         }
 
         var t = _trials[_trialIdx];
 
-        // UI label
-        int trialNumber = _trialIdx + 1;
-        int stages = t.StageCount;
-        stageLabelText.text = (stages == 2)
-            ? $"Session {_sessionIdx} | Trial {trialNumber}-{_stageInTrial + 1}"
-            : $"Session {_sessionIdx} | Trial {trialNumber}";
-
+        // ALWAYS keep guide image synced with current trial kind
         UpdateAxisGuideSprite(t.kind);
 
-        // slider = SIGMA in session 1..
+        string part = GetPartLabel(t, _stageInTrial);
+
+        if (stageLabelText)
+            stageLabelText.text = $"Session {_sessionIdx} - Trial {_trialIdx + 1}/{_trials.Count} - {t.kind} - {part}";
+
+        if (instructionText)
+        {
+            if ((t.kind == TrialKind.Yaw || t.kind == TrialKind.Pitch) && _stageInTrial == 0)
+                instructionText.text = "Main stage: slider tunes OVERALL flow (main + seam together).";
+            else if ((t.kind == TrialKind.Yaw || t.kind == TrialKind.Pitch) && _stageInTrial == 1)
+                instructionText.text = "Seam stage: slider tunes seam only (fine adjustment).";
+            else
+                instructionText.text = "Adjust sigma, then press Play (or Next if auto).";
+        }
+
+        // slider config
         sigmaSlider.minValue = sigmaMin;
         sigmaSlider.maxValue = sigmaMax;
 
         float startSigma = DecideInitialSigmaForStage(t, _stageInTrial);
         startSigma = Snap(startSigma, sigmaMin, sigmaMax, sigmaStep);
-
         sigmaSlider.SetValueWithoutNotify(startSigma);
         UpdateSigmaValueText(startSigma);
 
-        // playback start
-        StartPlaybackForStage(t, _stageInTrial, startSigma);
-    }
-
-    private void UpdateAxisGuideSprite(TrialKind kind)
-    {
-        if (axisGuideImage == null) return;
-
-        axisGuideImage.enabled = showAxisImage;
-        if (!showAxisImage) return;
-
-        switch (kind)
+        if (!requirePlayButtonPerStage)
         {
-            case TrialKind.Yaw: axisGuideImage.sprite = yawSprite; break;
-            case TrialKind.Roll: axisGuideImage.sprite = rollSprite; break;
-            case TrialKind.Pitch: axisGuideImage.sprite = pitchSprite; break;
+            StartPlaybackForStage(t, _stageInTrial, startSigma);
+            _isPlaying = true;
         }
-
-        axisGuideImage.preserveAspect = true;
     }
 
     private float DecideInitialSigmaForStage(Trial t, int stageIdx0)
     {
-        // yaw/pitch 2-stage: stage2 carries stage1
-        if (t.kind == TrialKind.Yaw)
-        {
-            if (stageIdx0 == 0)
-            {
-                if (randomizeSliderStart) return RandomValue(sigmaMin, sigmaMax);
-                return sigmaDefault;
-            }
-            if (_lastYawStage1Sigma > 0f) return _lastYawStage1Sigma;
-            return sigmaDefault;
-        }
+        // For Yaw/Pitch seam stage, start from stage0 sigma (because stage0 sets both together)
+        if (t.kind == TrialKind.Yaw && stageIdx0 == 1 && _lastYawStage0Sigma > 0f) return _lastYawStage0Sigma;
+        if (t.kind == TrialKind.Pitch && stageIdx0 == 1 && _lastPitchStage0Sigma > 0f) return _lastPitchStage0Sigma;
 
-        if (t.kind == TrialKind.Pitch)
-        {
-            if (stageIdx0 == 0)
-            {
-                if (randomizeSliderStart) return RandomValue(sigmaMin, sigmaMax);
-                return sigmaDefault;
-            }
-            if (_lastPitchStage1Sigma > 0f) return _lastPitchStage1Sigma;
-            return sigmaDefault;
-        }
+        if (!randomizeSliderStart) return sigmaDefault;
 
-        // roll: 1 stage
-        if (randomizeSliderStart) return RandomValue(sigmaMin, sigmaMax);
-        return sigmaDefault;
-    }
-
-    private float RandomValue(float mn, float mx)
-    {
-        double u = _rng.NextDouble();
-        return (float)(mn + (mx - mn) * u);
+        return UnityEngine.Random.Range(sigmaMin, sigmaMax);
     }
 
     private void StartPlaybackForStage(Trial t, int stageIdx0, float sigma)
     {
         float spd = t.speedDegPerSec;
-
-        // intensity is fixed already (Session 0 result)
         ApplyCalibratedIntensityToAllControllers();
 
         if (t.kind == TrialKind.Yaw)
         {
-            var st = (stageIdx0 == 0)
-                ? YawGaussianPathStageController.YawStage.Front   // main (front+back)
-                : YawGaussianPathStageController.YawStage.Side;   // seam
-
-            yawCtrl.SetSigmaForStage(st, sigma);
-            yawCtrl.StartStage(st, spd);
+            if (stageIdx0 == 0)
+            {
+                // ✅ Main stage = overall flow: link main + seam
+                yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Front, sigma);
+                yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Side,  sigma);
+                yawCtrl.StartStage(YawGaussianPathStageController.YawStage.Front, spd);
+            }
+            else
+            {
+                // ✅ Seam stage = seam only
+                yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Side, sigma);
+                yawCtrl.StartStage(YawGaussianPathStageController.YawStage.Side, spd);
+            }
         }
         else if (t.kind == TrialKind.Roll)
         {
@@ -433,132 +362,111 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
         }
         else // Pitch
         {
-            var st = (stageIdx0 == 0)
-                ? PitchGaussianPathStageController.PitchStage.Front // main
-                : PitchGaussianPathStageController.PitchStage.Top;  // seam
-
-            pitchCtrl.SetSigmaForStage(st, sigma);
-            pitchCtrl.StartStage(st, spd);
+            if (stageIdx0 == 0)
+            {
+                // ✅ Main stage = overall flow: link main + seam
+                pitchCtrl.SetSigmaForStage(PitchGaussianPathStageController.PitchStage.Front, sigma);
+                pitchCtrl.SetSigmaForStage(PitchGaussianPathStageController.PitchStage.Top,   sigma);
+                pitchCtrl.StartStage(PitchGaussianPathStageController.PitchStage.Front, spd);
+            }
+            else
+            {
+                // ✅ Seam stage = seam only
+                pitchCtrl.SetSigmaForStage(PitchGaussianPathStageController.PitchStage.Top, sigma);
+                pitchCtrl.StartStage(PitchGaussianPathStageController.PitchStage.Top, spd);
+            }
         }
     }
 
     private void SafeStopAllControllers()
     {
-        if (yawCtrl != null) yawCtrl.StopAll();
-        if (pitchCtrl != null) pitchCtrl.StopAll();
-        if (rollCtrl != null) rollCtrl.StopHaptics();
+        if (yawCtrl) yawCtrl.StopAll();
+        if (rollCtrl) rollCtrl.StopHaptics();
+        if (pitchCtrl) pitchCtrl.StopAll();
     }
 
-    // =========================
-    // Slider events (Session0=Intensity, Session1..=Sigma)
-    // =========================
-    private void OnSliderChanged(float v)
+    private void UpdateAxisGuideSprite(TrialKind kind)
     {
-        // session 0: intensity live update
+        if (!axisGuideImage) return;
+
+        axisGuideImage.enabled = showAxisImage;
+        if (!showAxisImage) return;
+
+        switch (kind)
+        {
+            case TrialKind.Yaw:   axisGuideImage.sprite = yawSprite; break;
+            case TrialKind.Roll:  axisGuideImage.sprite = rollSprite; break;
+            case TrialKind.Pitch: axisGuideImage.sprite = pitchSprite; break;
+        }
+    }
+
+    private string GetPartLabel(Trial t, int stageIdx0)
+    {
+        if (t.kind == TrialKind.Roll) return "full";
+        if (t.kind == TrialKind.Yaw) return (stageIdx0 == 0) ? "main(front+back)" : "seam";
+        return (stageIdx0 == 0) ? "main(front+back)" : "seam";
+    }
+
+    private void OnPlay()
+    {
+        if (_sessionIdx == 0) return; // calibration is always playing
+
+        if (_trialIdx >= _trials.Count) return;
+
+        var t = _trials[_trialIdx];
+        float sigma = sigmaSlider.value;
+
+        StartPlaybackForStage(t, _stageInTrial, sigma);
+        _isPlaying = true;
+    }
+
+    private void OnNext()
+    {
         if (_sessionIdx == 0)
         {
             var step = _calSteps[Mathf.Clamp(_calStepIdx, 0, _calSteps.Count - 1)];
-
-            v = Snap(v, intensityMin, intensityMax, intensityStep);
-            sigmaSlider.SetValueWithoutNotify(v);
-            UpdateSigmaValueText(v);
-
-            ApplyIntensityForKind(step.kind, v);
-            return;
-        }
-
-        // session 1..: sigma live update
-        v = Snap(v, sigmaMin, sigmaMax, sigmaStep);
-        sigmaSlider.SetValueWithoutNotify(v);
-        UpdateSigmaValueText(v);
-
-        if (_trialIdx >= _trials.Count) return;
-        var t = _trials[_trialIdx];
-
-        if (t.kind == TrialKind.Yaw)
-        {
-            var st = (_stageInTrial == 0)
-                ? YawGaussianPathStageController.YawStage.Front
-                : YawGaussianPathStageController.YawStage.Side;
-
-            yawCtrl.SetSigmaForStage(st, v);
-        }
-        else if (t.kind == TrialKind.Pitch)
-        {
-            var st = (_stageInTrial == 0)
-                ? PitchGaussianPathStageController.PitchStage.Front
-                : PitchGaussianPathStageController.PitchStage.Top;
-
-            pitchCtrl.SetSigmaForStage(st, v);
-        }
-        else
-        {
-            // roll: sigma 필요하면 rollCtrl 내부 setter 연결
-        }
-    }
-
-    private void OnNextClicked()
-    {
-        // ===== Session 0: save intensity calibration
-        if (_sessionIdx == 0)
-        {
-            var step = _calSteps[_calStepIdx];
-            float intensity01 = sigmaSlider.value;
-            intensity01 = Snap(intensity01, intensityMin, intensityMax, intensityStep);
-
-            SaveCalibrationIntensity(step.kind, intensity01);
-
-            // CSV (calibration)
-            AppendCsvRow(
-                sessionIndex: 0,
-                mode: "calibration",
-                direction: step.kind,
-                speedDegPerSec: calibrationSpeedDegPerSec,
-                part: "intensity",
-                sigma: 0f,
-                intensity01: intensity01,
-                trialIndex1Based: 0,
-                stageInTrial1Based: 0
-            );
+            SaveCalibrationIntensity(step.kind, sigmaSlider.value);
 
             _calStepIdx++;
             EnterCalibrationStep();
             return;
         }
 
-        // ===== Session 1..: normal trial stage
-        if (_trialIdx < _trials.Count)
+        if (_trialIdx >= _trials.Count) return;
+
+        var t = _trials[_trialIdx];
+
+        if (requirePlayButtonPerStage && !_isPlaying)
         {
-            var t = _trials[_trialIdx];
-            float sigma = sigmaSlider.value;
-
-            if (t.kind == TrialKind.Yaw && _stageInTrial == 0) _lastYawStage1Sigma = sigma;
-            if (t.kind == TrialKind.Pitch && _stageInTrial == 0) _lastPitchStage1Sigma = sigma;
-
-            string part =
-                (t.kind == TrialKind.Yaw) ? (_stageInTrial == 0 ? "main" : "seam") :
-                (t.kind == TrialKind.Pitch) ? (_stageInTrial == 0 ? "main" : "seam") :
-                "main";
-
-            float intensityNow = GetIntensityForKind(t.kind);
-
-            AppendCsvRow(
-                sessionIndex: _sessionIdx,
-                mode: "trial",
-                direction: t.kind,
-                speedDegPerSec: t.speedDegPerSec,
-                part: part,
-                sigma: sigma,
-                intensity01: intensityNow,
-                trialIndex1Based: _trialIdx + 1,
-                stageInTrial1Based: _stageInTrial + 1
-            );
+            if (instructionText) instructionText.text = "Press Play first.";
+            return;
         }
 
-        var cur = _trials[_trialIdx];
-        _stageInTrial++;
+        float sigma = sigmaSlider.value;
 
-        if (_stageInTrial >= cur.StageCount)
+        // carry stage0 sigma -> seam stage start
+        if (t.kind == TrialKind.Yaw && _stageInTrial == 0) _lastYawStage0Sigma = sigma;
+        if (t.kind == TrialKind.Pitch && _stageInTrial == 0) _lastPitchStage0Sigma = sigma;
+
+        // CSV row
+        string part = GetPartLabel(t, _stageInTrial);
+        float intensityNow = GetIntensityForKind(t.kind);
+
+        AppendCsvRow(
+            sessionIndex: _sessionIdx,
+            mode: "trial",
+            direction: t.kind,
+            speedDegPerSec: t.speedDegPerSec,
+            part: part,
+            sigma: sigma,
+            intensity01: intensityNow,
+            trialIndex1Based: _trialIdx + 1,
+            stageInTrial1Based: _stageInTrial + 1
+        );
+
+        // advance
+        _stageInTrial++;
+        if (_stageInTrial >= t.StageCount)
         {
             _trialIdx++;
             _stageInTrial = 0;
@@ -575,8 +483,94 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
     }
 
     // =========================
-    // CSV append
+    // Slider handler (UPDATED)
     // =========================
+    private void OnSliderChanged(float v)
+    {
+        // Session 0: intensity live update
+        if (_sessionIdx == 0)
+        {
+            var step = _calSteps[Mathf.Clamp(_calStepIdx, 0, _calSteps.Count - 1)];
+
+            v = Snap(v, intensityMin, intensityMax, intensityStep);
+            sigmaSlider.SetValueWithoutNotify(v);
+            UpdateSigmaValueText(v);
+
+            ApplyIntensityForKind(step.kind, v);
+            return;
+        }
+
+        // Session 1..: sigma live update
+        v = Snap(v, sigmaMin, sigmaMax, sigmaStep);
+        sigmaSlider.SetValueWithoutNotify(v);
+        UpdateSigmaValueText(v);
+
+        if (_trialIdx >= _trials.Count) return;
+
+        var t = _trials[_trialIdx];
+
+        if (t.kind == TrialKind.Yaw)
+        {
+            if (_stageInTrial == 0)
+            {
+                // ✅ Main stage = overall flow: link main + seam
+                yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Front, v);
+                yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Side,  v);
+            }
+            else
+            {
+                // ✅ Seam stage = seam only
+                yawCtrl.SetSigmaForStage(YawGaussianPathStageController.YawStage.Side, v);
+            }
+        }
+        else if (t.kind == TrialKind.Pitch)
+        {
+            if (_stageInTrial == 0)
+            {
+                // ✅ Main stage = overall flow: link main + seam
+                pitchCtrl.SetSigmaForStage(PitchGaussianPathStageController.PitchStage.Front, v);
+                pitchCtrl.SetSigmaForStage(PitchGaussianPathStageController.PitchStage.Top,   v);
+            }
+            else
+            {
+                // ✅ Seam stage = seam only
+                pitchCtrl.SetSigmaForStage(PitchGaussianPathStageController.PitchStage.Top, v);
+            }
+        }
+        else
+        {
+            // Roll: sigma not used (unless you add it later)
+        }
+    }
+
+    // =========================
+    // CSV
+    // =========================
+    private void PrepareCsv()
+    {
+        string dir = Path.Combine(Application.dataPath, "data");
+        if (!Directory.Exists(dir))
+            Directory.CreateDirectory(dir);
+
+        int idx = 1;
+        while (File.Exists(Path.Combine(dir, $"{idx}.csv")))
+            idx++;
+
+        _fileIndex = idx;
+        _finalCsvPath = Path.Combine(dir, $"{_fileIndex}.csv");
+
+        // ✅ Inspector에 "\n"이 문자로 저장돼 있어도 정상화
+        string header = csvHeader ?? "";
+        header = header.Replace("\\r\\n", "\n").Replace("\\n", "\n").Replace("\\r", "\n");
+
+        // ✅ 헤더 끝에 개행 1개 보장
+        if (!header.EndsWith("\n"))
+            header += "\n";
+
+        File.WriteAllText(_finalCsvPath, header);
+    }
+
+
     private void AppendCsvRow(
         int sessionIndex,
         string mode,
@@ -594,11 +588,11 @@ public class SigmaExperimentManager_TrialsRandom : MonoBehaviour
         string line = string.Join(",",
             _fileIndex.ToString(CultureInfo.InvariantCulture),
             sessionIndex.ToString(CultureInfo.InvariantCulture),
-            ts,
+            Quote(ts),
             Quote(mode),
             Quote(dir),
             speedDegPerSec.ToString(CultureInfo.InvariantCulture),
-            Quote(part),
+            Quote(part),                    // 🔥 중요
             sigma.ToString(CultureInfo.InvariantCulture),
             intensity01.ToString(CultureInfo.InvariantCulture),
             trialIndex1Based.ToString(CultureInfo.InvariantCulture),

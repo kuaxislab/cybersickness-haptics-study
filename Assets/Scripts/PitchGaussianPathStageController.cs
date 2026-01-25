@@ -2,21 +2,10 @@ using System;
 using UnityEngine;
 using Bhaptics.SDK2;
 
-/// <summary>
-/// Pitch full-loop Gaussian brush (Yaw Seam-aware Algorithm applied to Pitch)
-/// - Always full loop over (FrontPairs + BackPairs)
-/// - Constant speed (NO dwell control)
-/// - sigmaMain: body brush (Front + Back)
-/// - sigmaSeam: only near 2 seam boundaries
-///   Seam A (Top): between Front end and Back start
-///   Seam B (Bottom): between Back end and Front start
-///
-/// Manager stage meaning:
-/// - PitchStage.Front : sigmaMain tuning (body)
-/// - PitchStage.Top   : sigmaSeam tuning (seams)
-/// </summary>
 public class PitchGaussianPathStageController : MonoBehaviour
 {
+    public enum NormalizationMode { None, Peak, Energy }
+
     private const int VestMotorCount = 32;
 
     [Serializable]
@@ -27,10 +16,13 @@ public class PitchGaussianPathStageController : MonoBehaviour
         public Pair(int a, int b) { this.a = a; this.b = b; }
     }
 
-    // =========================
-    // Manager compatibility API
-    // =========================
-    public enum PitchStage { Front, Top } // "Top" is used as seam-tuning stage
+    public enum PitchStage { Front, Top } // Top = seam tuning stage
+
+    public void SetNormalizationMode(NormalizationMode mode, float energyTargetMotors = 2.5f)
+    {
+        normalizationMode = mode;
+        energyTarget = Mathf.Max(0.01f, energyTargetMotors);
+    }
 
     public void StartStage(PitchStage st, float speedDegPerSec)
     {
@@ -45,9 +37,10 @@ public class PitchGaussianPathStageController : MonoBehaviour
 
         Array.Clear(_raw01, 0, _raw01.Length);
         Array.Clear(_smoothed01, 0, _smoothed01.Length);
-        Array.Clear(_motorValues, 0, _motorValues.Length);
+        Array.Clear(_motorValues01, 0, _motorValues01.Length);
+        Array.Clear(_motorValuesInt, 0, _motorValuesInt.Length);
 
-        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValues, 80);
+        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValuesInt, 80);
     }
 
     public float GetSigmaForStage(PitchStage st) => (st == PitchStage.Front) ? sigmaMain : sigmaSeam;
@@ -55,18 +48,14 @@ public class PitchGaussianPathStageController : MonoBehaviour
     public void SetSigmaForStage(PitchStage st, float sigma)
     {
         sigma = Mathf.Max(1e-4f, sigma);
-        if (st == PitchStage.Front) sigmaMain = sigma;   // body brush
-        else sigmaSeam = sigma;                          // seam brush
+        if (st == PitchStage.Front) sigmaMain = sigma;
+        else sigmaSeam = sigma;
     }
 
     public void SetMaxIntensity01(float v) => maxIntensity01 = Mathf.Clamp01(v);
     public float GetMaxIntensity01() => maxIntensity01;
 
-    // =========================
-    // Paths (Front -> Back loop)
-    // =========================
     [Header("Pitch Loop Pairs")]
-    [Tooltip("Front (Upward): 12,15 -> 8,11 -> 4,7 -> 0,3")]
     [SerializeField] private Pair[] frontPairs =
     {
         new Pair(12,15),
@@ -75,7 +64,6 @@ public class PitchGaussianPathStageController : MonoBehaviour
         new Pair(0,3),
     };
 
-    [Tooltip("Back (Downward): 16,19 -> 20,23 -> 24,27 -> 28,31")]
     [SerializeField] private Pair[] backPairs =
     {
         new Pair(16,19),
@@ -84,9 +72,6 @@ public class PitchGaussianPathStageController : MonoBehaviour
         new Pair(28,31),
     };
 
-    // =========================
-    // Config (Yaw와 동일 결)
-    // =========================
     [Header("Speed (deg/sec)")]
     [SerializeField] private float angularSpeedDegPerSec = 60f;
 
@@ -94,19 +79,21 @@ public class PitchGaussianPathStageController : MonoBehaviour
     [Range(0f, 1f)]
     [SerializeField] private float maxIntensity01 = 0.30f;
 
+    [Header("Perceived Intensity Lock (optional)")]
+    [SerializeField] private NormalizationMode normalizationMode = NormalizationMode.None;
+    [SerializeField] private float energyTarget = 2.5f;
+
+    [Header("Normalization Smoothing")]
+    [SerializeField] private float normalizationTau = 0.12f;
+    private float _normScaleSmoothed = 1f;
+
     [Header("Sigma (Main vs Seam)")]
-    [Tooltip("Sigma for main body (Front+Back).")]
     [SerializeField] private float sigmaMain = 0.70f;
-
-    [Tooltip("Sigma for seams only (Top & Bottom connections). Usually larger.")]
     [SerializeField] private float sigmaSeam = 0.90f;
-
-    [Tooltip("Width of seam region (index units). 0.7~1.3 recommended.")]
     [SerializeField] private float seamWidthIdx = 1.0f;
 
     [Header("Neighborhood")]
-    [Tooltip("2 is recommended for smoothness at low speed.")]
-    [SerializeField] private int neighborPairs = 2;
+    [SerializeField] private int neighborCount = 2;
 
     [Header("Threshold & Cutoff")]
     [Range(0f, 0.4f)]
@@ -119,44 +106,44 @@ public class PitchGaussianPathStageController : MonoBehaviour
     [Range(0f, 0.2f)]
     [SerializeField] private float minOn01 = 0.00f;
 
-    [SerializeField] private float outputGamma = 1.20f;
-
-    [Header("Time smoothing")]
+    [Header("Smoothing")]
     [SerializeField] private float smoothingTau = 0.08f;
     [SerializeField] private bool useUnscaledTime = true;
 
-    [Header("bHaptics")]
-    [SerializeField] private int durationMillis = 30;
+    [Header("bHaptics Call")]
+    [SerializeField] private int durationMillis = 50;
 
-    // =========================
-    // Runtime
-    // =========================
     private bool _running;
-    private float _s;          // center position [0..N)
-    private Pair[] _loopPairs; // front + back
-    private int _N;
-    private int _frontLen;
+    private float _pos;
 
-    private readonly float[] _raw01 = new float[VestMotorCount];
-    private readonly float[] _smoothed01 = new float[VestMotorCount];
-    private readonly int[] _motorValues = new int[VestMotorCount];
+    private float[] _raw01 = new float[VestMotorCount];
+    private float[] _smoothed01 = new float[VestMotorCount];
 
-    private void Awake()
+    private float[] _motorValues01 = new float[VestMotorCount];
+    private int[] _motorValuesInt = new int[VestMotorCount];
+
+    private void OnDisable() => StopAll();
+
+    private void ResetState()
     {
-        RebuildLoop();
-        ResetState();
+        _pos = 0f;
+        Array.Clear(_raw01, 0, _raw01.Length);
+        Array.Clear(_smoothed01, 0, _smoothed01.Length);
+        Array.Clear(_motorValues01, 0, _motorValues01.Length);
+        Array.Clear(_motorValuesInt, 0, _motorValuesInt.Length);
+        _normScaleSmoothed = 1f;
     }
 
     private void OnValidate()
     {
-        neighborPairs = Mathf.Max(1, neighborPairs);
+        neighborCount = Mathf.Max(0, neighborCount);
         sigmaMain = Mathf.Max(1e-4f, sigmaMain);
         sigmaSeam = Mathf.Max(1e-4f, sigmaSeam);
-        seamWidthIdx = Mathf.Max(1e-3f, seamWidthIdx);
+        seamWidthIdx = Mathf.Max(1e-4f, seamWidthIdx);
         smoothingTau = Mathf.Max(1e-4f, smoothingTau);
+        normalizationTau = Mathf.Max(1e-4f, normalizationTau);
+        energyTarget = Mathf.Max(0.01f, energyTarget);
         durationMillis = Mathf.Max(10, durationMillis);
-
-        RebuildLoop();
     }
 
     private void Update()
@@ -166,165 +153,141 @@ public class PitchGaussianPathStageController : MonoBehaviour
         float dt = useUnscaledTime ? Time.unscaledDeltaTime : Time.deltaTime;
         if (dt <= 0f) return;
 
+        int nFront = frontPairs.Length;
+        int nBack = backPairs.Length;
+        int n = nFront + nBack;
+
+        float loopsPerSec = angularSpeedDegPerSec / 360f;
+        float stepsPerSec = loopsPerSec * n;
+
+        _pos += stepsPerSec * dt;
+        _pos %= n;
+
         Array.Clear(_raw01, 0, _raw01.Length);
 
-        if (_loopPairs == null || _N <= 0)
-        {
-            SmoothAndSend(dt);
-            return;
-        }
+        ApplySeamAwareGaussian(_pos, nFront, nBack);
 
-        // Yaw와 동일: constant speed in index-space
-        float cps = angularSpeedDegPerSec / 360f;
-        float speedIdxPerSec = cps * _N;
+        NormalizeRawIfNeeded(dt);
 
-        _s = Wrap(_s + speedIdxPerSec * dt, _N);
-
-        ApplyGaussianCircular_SeamAware(_s, maxIntensity01);
-        SmoothAndSend(dt);
-    }
-
-    private void RebuildLoop()
-    {
-        int fl = (frontPairs == null) ? 0 : frontPairs.Length;
-        int bl = (backPairs == null) ? 0 : backPairs.Length;
-
-        _frontLen = fl;
-        _N = Mathf.Max(0, fl + bl);
-        _loopPairs = new Pair[_N];
-
-        int w = 0;
-        for (int i = 0; i < fl; i++) _loopPairs[w++] = frontPairs[i];
-        for (int i = 0; i < bl; i++) _loopPairs[w++] = backPairs[i];
-    }
-
-    private void ResetState()
-    {
-        RebuildLoop();
-        _s = 0f;
-        Array.Clear(_raw01, 0, _raw01.Length);
-        Array.Clear(_smoothed01, 0, _smoothed01.Length);
-        Array.Clear(_motorValues, 0, _motorValues.Length);
-    }
-
-    // =========================
-    // Seam-aware Gaussian (Yaw랑 동일 아이디어)
-    // =========================
-    private void ApplyGaussianCircular_SeamAware(float center, float peak)
-    {
-        float c = Wrap(center, _N);
-        int ci = Mathf.FloorToInt(c);
-
-        // Seam A: between Front end and Back start => frontLen - 0.5
-        // Seam B: between Back end and Front start => N - 0.5
-        float seamA = (_frontLen <= 0) ? 0.5f : (_frontLen - 0.5f);
-        float seamB = _N - 0.5f;
-
-        float sigmaForCenter = IsNearSeam(c, seamA, seamB, _N, seamWidthIdx) ? sigmaSeam : sigmaMain;
-        sigmaForCenter = Mathf.Max(1e-4f, sigmaForCenter);
-        float inv2sig2 = 1f / (2f * sigmaForCenter * sigmaForCenter);
-
-        for (int k = -neighborPairs; k <= neighborPairs; k++)
-        {
-            int idx = Mod(ci + k, _N);
-            Pair p = _loopPairs[idx];
-
-            float d = CircularDelta(c, idx, _N);
-            float g = Mathf.Exp(-(d * d) * inv2sig2);
-            if (g < cutoff01) continue;
-
-            float norm = SoftThresholdKneeImproved(g, perceptualThreshold01);
-            float outVal = norm * peak;
-
-            WritePairMax(p, outVal);
-        }
-    }
-
-    private static bool IsNearSeam(float c, float seamA, float seamB, int N, float width)
-    {
-        float da = CircularDelta(c, seamA, N);
-        float db = CircularDelta(c, seamB, N);
-        return (Mathf.Abs(da) <= width) || (Mathf.Abs(db) <= width);
-    }
-
-    private void WritePairMax(Pair p, float v01)
-    {
-        if (p.a >= 0 && p.a < VestMotorCount) _raw01[p.a] = Mathf.Max(_raw01[p.a], v01);
-        if (p.b >= 0 && p.b < VestMotorCount) _raw01[p.b] = Mathf.Max(_raw01[p.b], v01);
-    }
-
-    private static float SoftThresholdKneeImproved(float x01, float thr01)
-    {
-        if (x01 <= thr01) return 0f;
-
-        float range = 1f - thr01;
-        if (range <= 1e-6f) return x01;
-
-        float t = (x01 - thr01) / range;
-        t = Mathf.Clamp01(t);
-
-        // smoothstep
-        return t * t * (3f - 2f * t);
-    }
-
-    private void SmoothAndSend(float dt)
-    {
-        float alpha = 1f - Mathf.Exp(-dt / Mathf.Max(1e-5f, smoothingTau));
-        float peak = Mathf.Max(1e-4f, maxIntensity01);
+        float a = 1f - Mathf.Exp(-dt / Mathf.Max(1e-5f, smoothingTau));
+        for (int i = 0; i < VestMotorCount; i++)
+            _smoothed01[i] = Mathf.Lerp(_smoothed01[i], _raw01[i], a);
 
         for (int i = 0; i < VestMotorCount; i++)
         {
-            _smoothed01[i] = Mathf.Lerp(_smoothed01[i], _raw01[i], alpha);
             float v = _smoothed01[i];
-
-            if (v > 0f)
-            {
-                float norm = Mathf.Clamp01(v / peak);
-                if (minOn01 > 0f && norm > 0f && norm < minOn01) norm = minOn01;
-
-                norm = Mathf.Pow(norm, Mathf.Max(0.01f, outputGamma));
-                v = norm * peak;
-            }
-
-            _motorValues[i] = Mathf.RoundToInt(Mathf.Clamp01(v) * 100f);
+            if (v < perceptualThreshold01) v = 0f;
+            if (v > 0f && v < minOn01) v = minOn01;
+            _motorValues01[i] = v;
         }
 
-        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValues, durationMillis);
+        // ✅ float(0..1) -> int(0..100)
+        for (int i = 0; i < VestMotorCount; i++)
+            _motorValuesInt[i] = Mathf.Clamp(Mathf.RoundToInt(_motorValues01[i] * 100f), 0, 100);
+
+        BhapticsLibrary.PlayMotors((int)PositionType.Vest, _motorValuesInt, durationMillis);
     }
 
-    // =========================
-    // Math helpers
-    // =========================
-    private static float Wrap(float x, int m)
+    private void NormalizeRawIfNeeded(float dt)
     {
-        if (m <= 0) return 0f;
-        x %= m;
-        if (x < 0f) x += m;
-        return x;
+        if (normalizationMode == NormalizationMode.None)
+        {
+            _normScaleSmoothed = 1f;
+            return;
+        }
+
+        float peak = Mathf.Max(1e-4f, maxIntensity01);
+        float targetScale = 1f;
+
+        if (normalizationMode == NormalizationMode.Peak)
+        {
+            float maxRaw = 0f;
+            for (int i = 0; i < VestMotorCount; i++) maxRaw = Mathf.Max(maxRaw, _raw01[i]);
+            if (maxRaw > 1e-6f) targetScale = peak / maxRaw;
+        }
+        else // Energy
+        {
+            float sumNorm = 0f;
+            for (int i = 0; i < VestMotorCount; i++) sumNorm += (_raw01[i] / peak);
+            float desired = Mathf.Max(1e-3f, energyTarget);
+            if (sumNorm > 1e-6f) targetScale = desired / sumNorm;
+        }
+
+        float tau = Mathf.Max(1e-5f, normalizationTau);
+        float a = 1f - Mathf.Exp(-dt / tau);
+        _normScaleSmoothed = Mathf.Lerp(_normScaleSmoothed, targetScale, a);
+
+        float scale = _normScaleSmoothed;
+        if (Mathf.Abs(scale - 1f) < 1e-4f) return;
+
+        for (int i = 0; i < VestMotorCount; i++)
+            _raw01[i] = Mathf.Clamp(_raw01[i] * scale, 0f, peak);
     }
 
-    private static int Mod(int x, int m)
+    private void ApplySeamAwareGaussian(float centerIdx, int nFront, int nBack)
+    {
+        int n = nFront + nBack;
+
+        float seamA = nFront - 0.5f;
+        float seamB = n - 0.5f;
+
+        for (int k = -neighborCount; k <= neighborCount; k++)
+        {
+            float x = centerIdx + k;
+            int idx = Mod(Mathf.RoundToInt(x), n);
+
+            float d = WrapDist(centerIdx, idx, n);
+            float seamW = SeamWeight(centerIdx, seamA, seamB, n, seamWidthIdx);
+            float sigma = Mathf.Lerp(sigmaMain, sigmaSeam, seamW);
+
+            float g = Mathf.Exp(-(d * d) / (2f * sigma * sigma));
+            float v = maxIntensity01 * g;
+
+            if (v < cutoff01) continue;
+
+            ApplyToMotorsAtIndex(idx, nFront, v);
+        }
+    }
+
+    private void ApplyToMotorsAtIndex(int idx, int nFront, float v)
+    {
+        if (idx < nFront)
+        {
+            var p = frontPairs[idx];
+            _raw01[p.a] = Mathf.Max(_raw01[p.a], v);
+            _raw01[p.b] = Mathf.Max(_raw01[p.b], v);
+        }
+        else
+        {
+            var p = backPairs[idx - nFront];
+            _raw01[p.a] = Mathf.Max(_raw01[p.a], v);
+            _raw01[p.b] = Mathf.Max(_raw01[p.b], v);
+        }
+    }
+
+    private float SeamWeight(float centerIdx, float seamA, float seamB, int n, float width)
+    {
+        float da = WrapAbs(centerIdx - seamA, n);
+        float db = WrapAbs(centerIdx - seamB, n);
+        float d = Mathf.Min(da, db);
+        return Mathf.Clamp01(1f - (d / Mathf.Max(1e-4f, width)));
+    }
+
+    private float WrapAbs(float x, int n)
+    {
+        x = Mathf.Abs(x);
+        return Mathf.Min(x, n - x);
+    }
+
+    private float WrapDist(float a, float b, int n)
+    {
+        float d = Mathf.Abs(a - b);
+        return Mathf.Min(d, n - d);
+    }
+
+    private int Mod(int x, int m)
     {
         int r = x % m;
-        if (r < 0) r += m;
-        return r;
-    }
-
-    private static float CircularDelta(float center, int idx, int N)
-    {
-        float d = center - idx;
-        float half = N * 0.5f;
-        if (d > half) d -= N;
-        if (d < -half) d += N;
-        return d;
-    }
-
-    private static float CircularDelta(float a, float b, int N)
-    {
-        float d = a - b;
-        float half = N * 0.5f;
-        if (d > half) d -= N;
-        if (d < -half) d += N;
-        return d;
+        return (r < 0) ? r + m : r;
     }
 }

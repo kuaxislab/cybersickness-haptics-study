@@ -63,7 +63,9 @@ public class ExperimentFlowManager : MonoBehaviour
     [Header("Participant / Logging")]
     public string participantId = "P01";
     public string saveFolderRelativeToAssets = "Data";
-    public string csvFileName = "axis_line_flow.csv";
+
+    [Tooltip("CSV file name format: 1_line.csv, 2_line.csv, ...")]
+    public string csvPrefix = "line";
 
     // =========================
     // Per-axis Params
@@ -106,8 +108,9 @@ public class ExperimentFlowManager : MonoBehaviour
     [Header("State")]
     public AxisStep step = AxisStep.Yaw;
 
-    // counts: Yaw(4) / Roll(3) / Pitch(2)에서 재사용
+    // counts: Yaw(4) / Roll(3) / Pitch(2) reuse
     private int[] _testCounts = new int[4];
+
     private string _csvPath;
 
     private void Awake()
@@ -119,13 +122,18 @@ public class ExperimentFlowManager : MonoBehaviour
             return;
         }
 
+        // Force requested speeds (even if Inspector differs)
+        yawParams.speedDegPerSec = 40f;
+        rollParams.speedDegPerSec = 40f;
+        pitchParams.speedDegPerSec = 30f;
+
         PrepareCsv();
 
         if (submitButton) submitButton.onClick.AddListener(Submit);
 
         InitRankDropdowns();
 
-        // 시작부터 Yaw
+        // start: Yaw
         step = AxisStep.Yaw;
         EnterStepUI(step);
         SetHint("Test freely, rank them, then Next.");
@@ -136,12 +144,11 @@ public class ExperimentFlowManager : MonoBehaviour
     {
         if (step != AxisStep.Yaw && step != AxisStep.Roll && step != AxisStep.Pitch) return;
 
-        // 막힘 방지: 테스트 여부로 막지 말고, 랭킹만 유효하면 진행
-        if (!TryGetRanking(step, out int bestIndex1Based, out string rankingText))
+        if (!TryGetRanking(step, out int bestIndex1Based, out string[] orderedChoices, out int[] itemRanks))
             return;
 
         StopAll();
-        AppendCsvRow(bestIndex1Based, rankingText);
+        AppendCsvRow(bestIndex1Based, orderedChoices, itemRanks);
 
         if (step == AxisStep.Yaw) step = AxisStep.Roll;
         else if (step == AxisStep.Roll) step = AxisStep.Pitch;
@@ -151,7 +158,7 @@ public class ExperimentFlowManager : MonoBehaviour
         SetHint(step == AxisStep.Done ? "Done. Thank you!" : $"Next: {step}. Test, rank, Next.");
     }
 
-    // 내부 정리용
+    // internal stop
     public void StopAll()
     {
         yawPlayer.StopAll();
@@ -171,10 +178,10 @@ public class ExperimentFlowManager : MonoBehaviour
         ApplyParamsForCurrentStep();
         yawPlayer.StartRoute(idx1to4);
 
-        SetHint($"[Yaw] Testing #{idx1to4} (count: {_testCounts[idx1to4 - 1]})");
+        SetHint($"[Yaw] Testing T{idx1to4} (count: {_testCounts[idx1to4 - 1]})");
     }
 
-    // Roll: Front / Back / Both(동시)
+    // Roll: Front / Back / Both
     public void TestRollFront()
     {
         if (step != AxisStep.Roll) return;
@@ -266,7 +273,6 @@ public class ExperimentFlowManager : MonoBehaviour
 
         ResetRankUI(s);
 
-        // ✅ 함정 제거: Submit은 activeStep이면 항상 보이고, Done이면 숨김
         if (submitButton)
         {
             submitButton.gameObject.SetActive(activeStep);
@@ -317,12 +323,12 @@ public class ExperimentFlowManager : MonoBehaviour
         else if (step == AxisStep.Roll)
         {
             if (rollCountFrontText) rollCountFrontText.text = _testCounts[0].ToString();
-            if (rollCountBackText)  rollCountBackText.text  = _testCounts[1].ToString();
-            if (rollCountBothText)  rollCountBothText.text  = _testCounts[2].ToString();
+            if (rollCountBackText) rollCountBackText.text = _testCounts[1].ToString();
+            if (rollCountBothText) rollCountBothText.text = _testCounts[2].ToString();
         }
         else if (step == AxisStep.Pitch)
         {
-            if (pitchCountEdgeText)   pitchCountEdgeText.text   = _testCounts[0].ToString();
+            if (pitchCountEdgeText) pitchCountEdgeText.text = _testCounts[0].ToString();
             if (pitchCountCenterText) pitchCountCenterText.text = _testCounts[1].ToString();
         }
     }
@@ -388,48 +394,96 @@ public class ExperimentFlowManager : MonoBehaviour
         dd.RefreshShownValue();
     }
 
-    private bool TryGetRanking(AxisStep s, out int bestIndex1Based, out string rankingText)
+    /// <summary>
+    /// Returns:
+    /// - bestIndex1Based: which item is ranked #1 (1-based index in that step's item list)
+    /// - orderedChoices: choice1..choice4 (1st..4th place labels). Unused entries are "".
+    /// - itemRanks: rank per item in fixed order (e.g., yaw: [T1,T2,T3,T4], roll: [Front,Back,Both], pitch: [Edge,Center])
+    /// </summary>
+    private bool TryGetRanking(AxisStep s, out int bestIndex1Based, out string[] orderedChoices, out int[] itemRanks)
     {
         bestIndex1Based = -1;
-        rankingText = "";
+        orderedChoices = new string[4] { "", "", "", "" };
+        itemRanks = Array.Empty<int>();
 
         if (s == AxisStep.Yaw)
         {
-            int[] ranks = new int[4];
             TMP_Dropdown[] dds = { yawRankTest1, yawRankTest2, yawRankTest3, yawRankTest4 };
-
+            int[] ranks = new int[4];
             if (!ReadRanks(dds, 4, ranks)) return false;
 
+            itemRanks = ranks;
+
+            // best = item whose rank is 1
             for (int i = 0; i < 4; i++)
                 if (ranks[i] == 1) bestIndex1Based = i + 1;
 
-            rankingText = $"T1={ranks[0]};T2={ranks[1]};T3={ranks[2]};T4={ranks[3]}";
+            // ordered choices by rank: 1st..4th
+            for (int r = 1; r <= 4; r++)
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    if (ranks[i] == r)
+                    {
+                        orderedChoices[r - 1] = $"T{i + 1}";
+                        break;
+                    }
+                }
+            }
+
             return true;
         }
 
         if (s == AxisStep.Roll)
         {
-            int[] ranks = new int[3];
             TMP_Dropdown[] dds = { rollRankFront, rollRankBack, rollRankBoth };
-
+            int[] ranks = new int[3];
             if (!ReadRanks(dds, 3, ranks)) return false;
+
+            itemRanks = ranks;
 
             for (int i = 0; i < 3; i++)
                 if (ranks[i] == 1) bestIndex1Based = i + 1;
 
-            rankingText = $"Front={ranks[0]};Back={ranks[1]};Both={ranks[2]}";
+            string[] labels = { "Front", "Back", "Both" };
+            for (int r = 1; r <= 3; r++)
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    if (ranks[i] == r)
+                    {
+                        orderedChoices[r - 1] = labels[i];
+                        break;
+                    }
+                }
+            }
+
             return true;
         }
 
         if (s == AxisStep.Pitch)
         {
-            int[] ranks = new int[2];
             TMP_Dropdown[] dds = { pitchRankEdge, pitchRankCenter };
-
+            int[] ranks = new int[2];
             if (!ReadRanks(dds, 2, ranks)) return false;
 
+            itemRanks = ranks;
+
             bestIndex1Based = (ranks[0] == 1) ? 1 : 2;
-            rankingText = $"Edge={ranks[0]};Center={ranks[1]}";
+
+            string[] labels = { "Edge", "Center" };
+            for (int r = 1; r <= 2; r++)
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    if (ranks[i] == r)
+                    {
+                        orderedChoices[r - 1] = labels[i];
+                        break;
+                    }
+                }
+            }
+
             return true;
         }
 
@@ -479,17 +533,11 @@ public class ExperimentFlowManager : MonoBehaviour
     private void ApplyParamsForCurrentStep()
     {
         if (step == AxisStep.Yaw)
-        {
             ApplyToYaw(yawParams);
-        }
         else if (step == AxisStep.Roll)
-        {
             ApplyToRoll(rollParams);
-        }
         else if (step == AxisStep.Pitch)
-        {
             ApplyToPitch(pitchParams);
-        }
     }
 
     private void ApplyToYaw(AxisParams p)
@@ -521,19 +569,36 @@ public class ExperimentFlowManager : MonoBehaviour
     {
         string dir = Path.Combine(Application.dataPath, saveFolderRelativeToAssets);
         Directory.CreateDirectory(dir);
-        _csvPath = Path.Combine(dir, csvFileName);
 
-        if (!File.Exists(_csvPath))
+        int index = 1;
+        while (true)
         {
-            File.WriteAllText(_csvPath,
-                "timestamp_iso,participant,step,best,rankingText," +
-                "testCount1,testCount2,testCount3,testCount4," +
-                "intensity01,sigmaMain,sigmaSeam,seamWidthIdx,thr,cutoff,smoothingTau,gamma,minOn,speedDegPerSec,durationMillis\n",
-                Encoding.UTF8);
+            string fileName = $"{index}_{csvPrefix}.csv"; // 1_line.csv, 2_line.csv, ...
+            string fullPath = Path.Combine(dir, fileName);
+            if (!File.Exists(fullPath))
+            {
+                _csvPath = fullPath;
+                break;
+            }
+            index++;
         }
+
+        // Unified header: ranks + ordered choices saved separately.
+        // rank1..rank4: item ranks (step-dependent)
+        // choice1..choice4: 1st..4th place items (step-dependent)
+        File.WriteAllText(_csvPath,
+            "timestamp_iso,participant,step," +
+            "bestIndex1Based," +
+            "rank1,rank2,rank3,rank4," +
+            "choice1,choice2,choice3,choice4," +
+            "testCount1,testCount2,testCount3,testCount4," +
+            "intensity01,sigmaMain,sigmaSeam,seamWidthIdx,thr,cutoff,smoothingTau,gamma,minOn,speedDegPerSec,durationMillis\n",
+            Encoding.UTF8);
+
+        Debug.Log($"[FlowManager] CSV created: {_csvPath}");
     }
 
-    private void AppendCsvRow(int best, string rankingText)
+    private void AppendCsvRow(int bestIndex1Based, string[] orderedChoices, int[] itemRanks)
     {
         string ts = DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture);
 
@@ -541,14 +606,32 @@ public class ExperimentFlowManager : MonoBehaviour
                     : (step == AxisStep.Roll) ? rollParams
                     : pitchParams;
 
+        // Map ranks into rank1..rank4 columns (step-dependent)
+        // Yaw: ranks=[T1,T2,T3,T4]
+        // Roll: ranks=[Front,Back,Both] => rank4 blank
+        // Pitch: ranks=[Edge,Center] => rank3,rank4 blank
+        string r1 = (itemRanks.Length >= 1) ? itemRanks[0].ToString(CultureInfo.InvariantCulture) : "";
+        string r2 = (itemRanks.Length >= 2) ? itemRanks[1].ToString(CultureInfo.InvariantCulture) : "";
+        string r3 = (itemRanks.Length >= 3) ? itemRanks[2].ToString(CultureInfo.InvariantCulture) : "";
+        string r4 = (itemRanks.Length >= 4) ? itemRanks[3].ToString(CultureInfo.InvariantCulture) : "";
+
+        string c1 = (orderedChoices.Length >= 1) ? orderedChoices[0] : "";
+        string c2 = (orderedChoices.Length >= 2) ? orderedChoices[1] : "";
+        string c3 = (orderedChoices.Length >= 3) ? orderedChoices[2] : "";
+        string c4 = (orderedChoices.Length >= 4) ? orderedChoices[3] : "";
+
         string line = string.Join(",",
             Q(ts), Q(participantId), Q(step.ToString()),
-            best.ToString(CultureInfo.InvariantCulture),
-            Q(rankingText),
+            bestIndex1Based.ToString(CultureInfo.InvariantCulture),
+
+            Q(r1), Q(r2), Q(r3), Q(r4),
+            Q(c1), Q(c2), Q(c3), Q(c4),
+
             _testCounts[0].ToString(CultureInfo.InvariantCulture),
             _testCounts[1].ToString(CultureInfo.InvariantCulture),
             _testCounts[2].ToString(CultureInfo.InvariantCulture),
             _testCounts[3].ToString(CultureInfo.InvariantCulture),
+
             p.intensity01.ToString(CultureInfo.InvariantCulture),
             p.sigmaMain.ToString(CultureInfo.InvariantCulture),
             p.sigmaSeam.ToString(CultureInfo.InvariantCulture),
@@ -563,7 +646,7 @@ public class ExperimentFlowManager : MonoBehaviour
         );
 
         File.AppendAllText(_csvPath, line + "\n", Encoding.UTF8);
-        Debug.Log($"[FlowManager] Saved row: {step} best={best} ranking={rankingText}");
+        Debug.Log($"[FlowManager] Saved row: {step} best={bestIndex1Based} choices={c1},{c2},{c3},{c4}");
     }
 
     private static string Q(string s) => $"\"{s}\"";

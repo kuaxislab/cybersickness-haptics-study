@@ -4,6 +4,8 @@ using Bhaptics.SDK2;
 
 public class RollGuassianPathState : MonoBehaviour
 {
+    public enum NormalizationMode { None, Peak, Energy }
+
     public enum SpeedMode { DegreesPerSecond, RadiansPerSecond, CyclesPerSecond }
 
     [Header("Speed")]
@@ -14,6 +16,13 @@ public class RollGuassianPathState : MonoBehaviour
 
     [Header("Intensity")]
     [Range(0f, 1f)] [SerializeField] private float maxIntensity01 = 0.85f;
+
+    [Header("Perceived Intensity Lock (optional)")]
+    [Tooltip("None: raw peak uses maxIntensity01. Peak: rescales so at least one motor hits peak each frame. Energy: keep total activation (sum) roughly constant across sigma.")]
+    [SerializeField] private NormalizationMode normalizationMode = NormalizationMode.None;
+    [Tooltip("Only used for Energy mode. Interpreted as 'number of motors at full intensity' (sum of v/peak). 1.5~3.5 is typical.")]
+    [SerializeField] private float energyTarget = 2.5f;
+
 
     [Header("Gaussian Shape")]
     [SerializeField] private float sigmaStepsMain = 0.9f;
@@ -51,6 +60,33 @@ public class RollGuassianPathState : MonoBehaviour
 
     private void OnDisable() => StopHaptics();
 
+    private void NormalizeRawIfNeeded()
+    {
+        if (normalizationMode == NormalizationMode.None) return;
+
+        float peak = Mathf.Max(1e-4f, maxIntensity01);
+        float scale = 1f;
+
+        if (normalizationMode == NormalizationMode.Peak)
+        {
+            float maxRaw = 0f;
+            for (int i = 0; i < VestMotorCount; i++) maxRaw = Mathf.Max(maxRaw, _raw01[i]);
+            if (maxRaw > 1e-6f) scale = peak / maxRaw;
+        }
+        else if (normalizationMode == NormalizationMode.Energy)
+        {
+            float sumNorm = 0f;
+            for (int i = 0; i < VestMotorCount; i++) sumNorm += (_raw01[i] / peak);
+            float desired = Mathf.Max(1e-3f, energyTarget);
+            if (sumNorm > 1e-6f) scale = desired / sumNorm;
+        }
+
+        if (Mathf.Abs(scale - 1f) < 1e-4f) return;
+
+        for (int i = 0; i < VestMotorCount; i++)
+            _raw01[i] = Mathf.Clamp(_raw01[i] * scale, 0f, peak);
+    }
+
     private void Update()
     {
         if (!_running) return;
@@ -76,6 +112,7 @@ public class RollGuassianPathState : MonoBehaviour
         float centerSub = GetSubCenterFromMain(_step, _phase);
         ApplyGaussianOnPath(subFront, centerSub, sigmaStepsSub, neighborCountSub, subScale);
 
+        NormalizeRawIfNeeded();
         float a = 1f - Mathf.Exp(-dt / Mathf.Max(0.0001f, smoothingTau));
         for (int i = 0; i < VestMotorCount; i++)
             _smoothed01[i] = Mathf.Lerp(_smoothed01[i], _raw01[i], a);
@@ -184,6 +221,12 @@ public class RollGuassianPathState : MonoBehaviour
         if (d < 0f) d += len;
         d -= len * 0.5f;
         return d;
+    }
+
+    public void SetNormalizationMode(NormalizationMode mode, float energyTargetMotors = 2.5f)
+    {
+        normalizationMode = mode;
+        energyTarget = Mathf.Max(0.01f, energyTargetMotors);
     }
 
     public void SetMaxIntensity01(float v) => maxIntensity01 = Mathf.Clamp01(v);

@@ -45,7 +45,7 @@ public class YawLineExperiment_SameAlgorithm : MonoBehaviour
     // Routes (your spec)
     // =========================
     [Header("Yaw Routes")]
-    [SerializeField] private int[] route1 = { 0, 1, 2, 3, 4, 19, 18, 17, 16 };          // frontLen=5
+    [SerializeField] private int[] route1 = { 0, 1, 2, 3, 19, 18, 17, 16 };          // frontLen=5
     [SerializeField] private int[] route2 = { 4, 5, 6, 7, 23, 22, 21, 20 };              // frontLen=4
     [SerializeField] private int[] route3 = { 8, 9, 10, 11, 27, 26, 25, 24 };            // frontLen=4
     [SerializeField] private int[] route4 = { 12, 13, 14, 15, 31, 30, 29, 28 };          // frontLen=4
